@@ -136,7 +136,7 @@ jobs:
           export KBUILD_BUILD_USER="kleaf"
           export KBUILD_BUILD_HOST="build-host"
           export ARCH="arm64"
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc --all)"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc --all)" Image.lz4
 
       - name: Stage release files
         run: |
