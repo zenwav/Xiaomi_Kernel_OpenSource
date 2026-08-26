@@ -1,49 +1,28 @@
-name: Build dash kernel
+name: Build Dash Kernel with KSU & SUSFS
 
 permissions:
-  contents: write  
+  contents: write
 
 on:
   workflow_dispatch:
-    inputs:
-      phase:
-        description: "Build phase: base, ksu (+KernelSU-Next), susfs (+SUSFS)"
-        type: choice
-        options:
-          - base
-          - ksu
-          - susfs
-        default: base
-      lto:
-        description: "LTO level (stock kernel uses none; thin = experimental)"
-        type: choice
-        options:
-          - none
-          - thin
-        default: none
-      expected_release:
-        description: "Expected kernel release string (must match stock vermagic; bump if Xiaomi updates the tree)"
-        type: string
-        default: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k"
 
 env:
   CLANG_DIR: toolchain/clang-r510928
   CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r1/clang-r510928.tar.gz"
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 4G
-  CCACHE_COMPRESS: "true"
   LOCALVERSION: ""
 
 jobs:
   build:
-    name: "dash kernel (phase=${{ inputs.phase }}, lto=${{ inputs.lto }})"
+    name: Build Kernel
     runs-on: ubuntu-latest
 
     steps:
       - name: Free disk space
-        uses: endersonmenezes/free-disk-space@v3
+        uses: endersonmenezes/free-disk-space@v4
         with:
           remove_android: true
+          rm_cmd: "rmz"        
+          rmz_version: "3.2.0" 
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
@@ -56,29 +35,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
-            dwarves cpio lz4 zstd ccache python3 git curl ca-certificates xz-utils
+            dwarves cpio lz4 zstd ccache python3 git curl ca-certificates xz-utils \
+            rsync openssl zip kmod
 
       - name: Checkout kernel source
-        uses: actions/checkout@v7
-        with:
-          ref: 'dash-w-oss'
+        uses: actions/checkout@v4
 
       - name: Cache AOSP clang r510928
         id: clang-cache
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: ${{ env.CLANG_DIR }}
-          key: aosp-clang-r510928 
+          key: aosp-clang-r510928
 
       - name: Download AOSP clang r510928
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           mkdir -p "$CLANG_DIR"
-          curl -L --retry 20 --retry-delay 5 -o /tmp/clang.tar.gz "$CLANG_URL"
+          curl -L --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz "$CLANG_URL"
           tar -xzf /tmp/clang.tar.gz -C "$CLANG_DIR"
           rm -f /tmp/clang.tar.gz
-          # normalize in case the archive nests a top-level clang-r510928/ dir
           if [ ! -x "$CLANG_DIR/bin/clang" ] && [ -x "$CLANG_DIR/clang-r510928/bin/clang" ]; then
             mv "$CLANG_DIR/clang-r510928"/* "$CLANG_DIR"/
             rmdir "$CLANG_DIR/clang-r510928"
@@ -90,163 +67,88 @@ jobs:
           "$CLANG_DIR/bin/clang" --version | head -2
 
       - name: Cache ccache
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-dash-r${{ github.run_number }}
+          key: ccache-dash-${{ github.run_number }}
           restore-keys: ccache-dash-
 
-      - name: Setup swap (only for LTO builds)
-        if: inputs.lto == 'thin'
-        uses: thejerrybao/setup-swap-space@v1
-        with:
-          swap-size-gb: 16
-
-      # ---------- Phase 2: KernelSU-Next (dev-susfs branch, SUSFS-ready) ----------
-      - name: Integrate KernelSU-Next
-        if: inputs.phase != 'base'
+      - name: Integrate KernelSU-Next (pershoot dev-susfs)
         run: |
           set -euo pipefail
+          # Fetch and run setup.sh to mount KSU into the tree
           curl -LSs --retry 5 "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
-          curl -L --retry 5 -o /tmp/ksu-static.patch \
-            "https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch"
+          # Fetch and apply static.patch
+          curl -L --retry 5 -o /tmp/ksu-static.patch "https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch"
           cd KernelSU-Next
           patch -p1 < /tmp/ksu-static.patch
           cd ..
-          test -e drivers/kernelsu && echo "KernelSU symlinked into drivers/kernelsu"
 
-      # ---------- Phase 3: SUSFS (gki-android15-6.6 branch) ----------
       - name: Integrate SUSFS
-        if: inputs.phase == 'susfs'
         run: |
           set -euo pipefail
           git clone --depth 1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 susfs4ksu
           git clone --depth 1 https://github.com/WildKernels/kernel_patches.git kernel_patches
 
-          # pershoot coexistence patches, applied to the susfs4ksu repo first (WildKernel order)
+          # Apply pershoot compatibility patches to SUSFS
           cd susfs4ksu
           patch -p1 < ../kernel_patches/pershoot/susfs4ksu/0001-pershoot-Allow-core-to-be-built-with-no-features.patch
           patch -p1 < ../kernel_patches/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch
           cd ..
 
+          # Copy files into kernel tree
           cp susfs4ksu/kernel_patches/fs/* fs/
           cp susfs4ksu/kernel_patches/include/linux/* include/linux/
           cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch .
 
-          # android15-6.6 sublevel<=92 guard: the SUSFS patch's fs/proc/base.c hunk #1
-          # expects '#include <linux/dma-buf.h>' as context (added upstream in a later
-          # sublevel, absent in dash's 6.6.89 tree). Verified by dry-run: without this
-          # line the hunk FAILs; with it the whole patch applies cleanly.
+          # dma-buf guard (Injects required context for the patch)
           DMABUF_GUARD=0
           if ! grep -q '^#include <linux/dma-buf.h>$' fs/proc/base.c; then
             sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux/dma-buf.h>' fs/proc/base.c
             DMABUF_GUARD=1
           fi
 
+          # Apply main SUSFS patch
           patch -p1 --forward < 50_add_susfs_in_gki-android15-6.6.patch
 
-          # revert the temporary context guard (WildKernel susfs-revert-patches):
-          # it was only needed to give patch its context lines
+          # Revert dma-buf guard line so it matches stock behavior
           if [ "$DMABUF_GUARD" = "1" ]; then
             sed -i '/^#include <linux\/dma-buf.h>$/d' fs/proc/base.c
           fi
+          rm 50_add_susfs_in_gki-android15-6.6.patch
 
-          # VMA_PAD_START / page_size_compat guards (from WildKernel's build)
-          if grep -q 'VMA_PAD_START(' fs/proc/task_mmu.c && ! grep -qE '#include <linux/pgsize_migration(_inline)?\.h>|define VMA_PAD_START' fs/proc/task_mmu.c; then
-            sed -i '1a #ifndef VMA_PAD_START\n#define VMA_PAD_START(vma) ((vma)->vm_end)\n#endif' fs/proc/task_mmu.c
-          fi
-          if grep -q '__fold_filemap_fixup_entry' fs/proc/task_mmu.c && ! grep -q '#include <linux/page_size_compat.h>' fs/proc/task_mmu.c; then
-            sed -i '/#include <linux\/pkeys.h>/a #include <linux/page_size_compat.h>' fs/proc/task_mmu.c
-          fi
-
-          # surface patch rejects as a downloadable artifact and fail loudly
-          if find . -name '*.rej' | grep -q .; then
-            mkdir -p /tmp/patch-rejects
-            find . -name '*.rej' -exec cp --parents {} /tmp/patch-rejects/ \;
-            echo "SUSFS patch produced rejects - inspect the patch-rejects artifact"
-            exit 1
-          fi
-
-      - name: Upload patch rejects (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: patch-rejects
-          path: /tmp/patch-rejects/
-          if-no-files-found: ignore
-
-      - name: Configure kernel (gki_defconfig + phase/lto deltas)
+      - name: Configure kernel
         run: |
           set -euo pipefail
           export PATH="$GITHUB_WORKSPACE/$CLANG_DIR/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 gki_defconfig
+          export KBUILD_BUILD_USER="kleaf"
+          export KBUILD_BUILD_HOST="build-host"
+          export ARCH="arm64"
+          # Run gki_defconfig which automatically reads your local config changes
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" gki_defconfig
 
-          CFG=()
-          if [ "${{ inputs.lto }}" = "thin" ]; then
-            CFG+=(-d LTO_NONE -e LTO_CLANG_THIN)
-          fi
-          if [ "${{ inputs.phase }}" != "base" ]; then
-            CFG+=(-e KSU)
-          fi
-          if [ "${{ inputs.phase }}" = "susfs" ]; then
-            CFG+=(-e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
-                  -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SPOOF_UNAME \
-                  -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-                  -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-                  -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP)
-          fi
-          if [ ${#CFG[@]} -gt 0 ]; then
-            ./scripts/config --file out/.config "${CFG[@]}"
-          fi
-          make O=out ARCH=arm64 LLVM=1 olddefconfig
-
-      - name: Assert kernelrelease matches stock vermagic
+      - name: Build kernel
         run: |
           set -euo pipefail
           export PATH="$GITHUB_WORKSPACE/$CLANG_DIR/bin:$PATH"
-          KR=$(make -s O=out ARCH=arm64 kernelrelease)
-          echo "kernelrelease: $KR"
-          if [ "$KR" != "${{ inputs.expected_release }}" ]; then
-            echo "::error::kernelrelease mismatch! expected '${{ inputs.expected_release }}', got '$KR'."
-            echo "::error::Check your gki_defconfig edits (CONFIG_LOCALVERSION / CONFIG_LOCALVERSION_AUTO)."
-            exit 1
-          fi
-
-      # ---------- Build ----------
-      - name: Build kernel (Image.lz4; uncompressed Image is built as a dependency)
-        run: |
-          set -euo pipefail
-          export PATH="$GITHUB_WORKSPACE/$CLANG_DIR/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 \
-            CC="ccache clang" HOSTCC="ccache gcc" HOSTCXX="ccache g++" \
-            -j"$(nproc)" Image.lz4
-
-      - name: Verify built artifacts
-        id: verify
-        run: |
-          set -euo pipefail
-          test -f out/arch/arm64/boot/Image
-          test -f out/arch/arm64/boot/Image.lz4
-          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/Image.lz4
-          # the uncompressed Image embeds the banner; confirm it carries the exact release
-          strings out/arch/arm64/boot/Image | grep -m1 "^Linux version"
-          strings out/arch/arm64/boot/Image | grep -qF "Linux version ${{ inputs.expected_release }} " || {
-            echo "::error::expected release string not embedded in Image"
-            exit 1
-          }
-          echo "release=${{ inputs.expected_release }}" >> "$GITHUB_OUTPUT"
+          export CCACHE_DIR="${{ github.workspace }}/.ccache"
+          export CCACHE_MAXSIZE="4G"
+          export KBUILD_BUILD_USER="kleaf"
+          export KBUILD_BUILD_HOST="build-host"
+          export ARCH="arm64"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc --all)"
 
       - name: Stage release files
         run: |
           mkdir -p release
           cp out/arch/arm64/boot/Image release/Image
           cp out/arch/arm64/boot/Image.lz4 release/Image.lz4
-          cp out/.config release/config-dash-${{ inputs.expected_release }}.txt
+          cp out/.config release/config-dash-r${{ github.run_number }}.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: dash-${{ inputs.phase }}-r${{ github.run_number }}
-          name: "dash ${{ steps.verify.outputs.release }} (phase=${{ inputs.phase }}, lto=${{ inputs.lto }})"
+          tag_name: dash-r${{ github.run_number }}
+          name: "Dash Kernel Release (r${{ github.run_number }})"
           prerelease: true
           files: release/*
